@@ -1,7 +1,6 @@
 plugins {
-	id 'org.sonarqube' version '3.0'
-	id 'com.github.ben-manes.versions' version '0.33.0'
-	id "com.diffplug.spotless" version "5.5.1"
+	id 'com.github.ben-manes.versions' version '0.38.0'
+	id "com.diffplug.spotless" version "5.12.5"
 }
 
 ext.jadxVersion = System.getenv('JADX_VERSION') ?: "dev"
@@ -10,7 +9,6 @@ println("jadx version: ${jadxVersion}")
 
 allprojects {
 	apply plugin: 'java'
-	apply plugin: 'jacoco'
 	apply plugin: 'checkstyle'
 
 	version = jadxVersion
@@ -40,11 +38,11 @@ allprojects {
 
 		testImplementation 'ch.qos.logback:logback-classic:1.2.3'
 		testImplementation 'org.hamcrest:hamcrest-library:2.2'
-		testImplementation 'org.mockito:mockito-core:3.5.10'
-		testImplementation 'org.assertj:assertj-core:3.17.2'
+		testImplementation 'org.mockito:mockito-core:3.10.0'
+		testImplementation 'org.assertj:assertj-core:3.19.0'
 
-		testImplementation 'org.junit.jupiter:junit-jupiter-api:5.7.0'
-		testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.7.0'
+		testImplementation 'org.junit.jupiter:junit-jupiter-api:5.7.2'
+		testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.7.2'
 
 		testImplementation 'org.eclipse.jdt.core.compiler:ecj:4.6.1'
 		testCompileOnly 'org.jetbrains:annotations:20.1.0'
@@ -57,30 +55,12 @@ allprojects {
 	repositories {
 		mavenLocal()
 		mavenCentral()
-		jcenter()
 		google()
-	}
-
-	jacoco {
-		toolVersion = "0.8.6"
-	}
-	jacocoTestReport {
-		reports {
-			xml.enabled = true
-			html.enabled = true
-		}
 	}
 
 	checkstyleMain {
 		// exclude all sources in samples module
 		exclude '**/samples/**'
-	}
-}
-
-sonarqube {
-	properties {
-		property 'sonar.exclusions', '**/jadx/samples/**/*,**/test-app/**/*'
-		property 'sonar.coverage.exclusions', '**/jadx/gui/**/*'
 	}
 }
 
@@ -95,7 +75,12 @@ spotless {
 
 		importOrderFile 'config/code-formatter/eclipse.importorder'
 		eclipse().configFile 'config/code-formatter/eclipse.xml'
-		removeUnusedImports()
+		if (JavaVersion.current() < JavaVersion.VERSION_16) {
+			removeUnusedImports()
+		} else {
+			// google-format broken on java 16 (https://github.com/diffplug/spotless/issues/834)
+			println('Warning! Unused imports remove is disabled for Java 16')
+		}
 
 		lineEndings(com.diffplug.spotless.LineEnding.UNIX)
 		encoding("UTF-8")
@@ -128,32 +113,40 @@ dependencyUpdates {
 	}
 }
 
-task copyArtifacts(type: Sync, dependsOn: ['jadx-cli:installDist', 'jadx-gui:installDist']) {
-	destinationDir file("$buildDir/jadx")
-	['jadx-cli', 'jadx-gui'].each {
-		from tasks.getByPath(":${it}:installDist").destinationDir
-	}
+task copyArtifacts(type: Copy) {
+	from tasks.getByPath(":jadx-cli:installDist")
+	from tasks.getByPath(":jadx-gui:installDist")
+	into layout.buildDirectory.dir("jadx")
 	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-task pack(type: Zip, dependsOn: copyArtifacts) {
-	destinationDirectory = buildDir
+task pack(type: Zip) {
+	from copyArtifacts
 	archiveFileName = "jadx-${jadxVersion}.zip"
-	from copyArtifacts.destinationDir
+	destinationDirectory = layout.buildDirectory
 }
 
-task copyExe(type: Copy, dependsOn: 'jadx-gui:createExe') {
+task copyExe(type: Copy) {
 	group 'jadx'
 	description = 'Copy exe to build dir'
-	destinationDir buildDir
-	from tasks.getByPath('jadx-gui:createExe').outputs
+	mustRunAfter pack // not needed, but gradle throws warning because of same output dir
+
+	from tasks.getByPath('jadx-gui:createExe')
 	include '*.exe'
+	into layout.buildDirectory
 	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-task dist(dependsOn: [pack, copyExe]) {
+task dist {
 	group 'jadx'
 	description = 'Build jadx distribution zip'
+
+	dependsOn(pack)
+
+	OperatingSystem os = org.gradle.nativeplatform.platform.internal.DefaultNativePlatform.currentOperatingSystem;
+	if (os.isWindows()) {
+		dependsOn('copyExe')
+	}
 }
 
 task samples(dependsOn: 'jadx-samples:samples') {

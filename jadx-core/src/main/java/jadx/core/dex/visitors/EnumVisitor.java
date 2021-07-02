@@ -29,7 +29,6 @@ import jadx.core.dex.instructions.InvokeNode;
 import jadx.core.dex.instructions.args.ArgType;
 import jadx.core.dex.instructions.args.InsnArg;
 import jadx.core.dex.instructions.args.InsnWrapArg;
-import jadx.core.dex.instructions.args.LiteralArg;
 import jadx.core.dex.instructions.args.RegisterArg;
 import jadx.core.dex.instructions.args.SSAVar;
 import jadx.core.dex.instructions.mods.ConstructorInsn;
@@ -54,7 +53,7 @@ import static jadx.core.utils.InsnUtils.getWrappedInsn;
 @JadxVisitor(
 		name = "EnumVisitor",
 		desc = "Restore enum classes",
-		runAfter = { CodeShrinkVisitor.class, ModVisitor.class },
+		runAfter = { CodeShrinkVisitor.class, ModVisitor.class, ReSugarCode.class },
 		runBefore = { ExtractFieldInit.class }
 )
 public class EnumVisitor extends AbstractVisitor {
@@ -193,7 +192,15 @@ public class EnumVisitor extends AbstractVisitor {
 		if (ctrMth != null) {
 			markArgsForSkip(ctrMth);
 		}
-		InsnRemover.removeWithoutUnbind(classInitMth, staticBlock, co);
+		RegisterArg coResArg = co.getResult();
+		if (coResArg == null || coResArg.getSVar().getUseList().size() <= 2) {
+			InsnRemover.removeWithoutUnbind(classInitMth, staticBlock, co);
+		} else {
+			// constructor result used in other places -> replace constructor with enum field get (SGET)
+			IndexInsnNode enumGet = new IndexInsnNode(InsnType.SGET, enumField.getField().getFieldInfo(), 0);
+			enumGet.setResult(coResArg.duplicate());
+			BlockUtils.replaceInsn(classInitMth, staticBlock, co, enumGet);
+		}
 	}
 
 	@Nullable
@@ -209,7 +216,7 @@ public class EnumVisitor extends AbstractVisitor {
 
 			case NEW_ARRAY:
 				InsnArg arg = wrappedInsn.getArg(0);
-				if (arg.isLiteral() && ((LiteralArg) arg).getLiteral() == 0) {
+				if (arg.isZeroLiteral()) {
 					// empty enum
 					return Collections.emptyList();
 				}
@@ -263,9 +270,9 @@ public class EnumVisitor extends AbstractVisitor {
 			EnumField field = null;
 			if (arg.isInsnWrap()) {
 				InsnNode wrappedInsn = ((InsnWrapArg) arg).getWrapInsn();
-				field = processEnumFieldByField(cls, wrappedInsn, staticBlock, toRemove);
+				field = processEnumFieldByWrappedInsn(cls, wrappedInsn, staticBlock, toRemove);
 			} else if (arg.isRegister()) {
-				field = processEnumFiledByRegister(cls, (RegisterArg) arg, staticBlock, toRemove);
+				field = processEnumFieldByRegister(cls, (RegisterArg) arg, staticBlock, toRemove);
 			}
 			if (field == null) {
 				return null;
@@ -274,6 +281,19 @@ public class EnumVisitor extends AbstractVisitor {
 		}
 		toRemove.add(arrFillInsn);
 		return enumFields;
+	}
+
+	private EnumField processEnumFieldByWrappedInsn(ClassNode cls, InsnNode wrappedInsn, BlockNode staticBlock, List<InsnNode> toRemove) {
+		if (wrappedInsn.getType() == InsnType.SGET) {
+			return processEnumFieldByField(cls, wrappedInsn, staticBlock, toRemove);
+		}
+		ConstructorInsn constructorInsn = castConstructorInsn(wrappedInsn);
+		if (constructorInsn != null) {
+			FieldNode enumFieldNode = createFakeField(cls, "EF" + constructorInsn.getOffset());
+			cls.addField(enumFieldNode);
+			return createEnumFieldByConstructor(cls, enumFieldNode, constructorInsn);
+		}
+		return null;
 	}
 
 	@Nullable
@@ -304,16 +324,39 @@ public class EnumVisitor extends AbstractVisitor {
 	}
 
 	@Nullable
-	private EnumField processEnumFiledByRegister(ClassNode cls, RegisterArg arg, BlockNode staticBlock, List<InsnNode> toRemove) {
+	private EnumField processEnumFieldByRegister(ClassNode cls, RegisterArg arg, BlockNode staticBlock, List<InsnNode> toRemove) {
 		InsnNode assignInsn = arg.getAssignInsn();
 		if (assignInsn != null && assignInsn.getType() == InsnType.SGET) {
 			return processEnumFieldByField(cls, assignInsn, staticBlock, toRemove);
 		}
 
 		SSAVar ssaVar = arg.getSVar();
-		if (ssaVar.getUseCount() == 1) {
+		if (ssaVar.getUseCount() == 0) {
 			return null;
 		}
+		InsnNode constrInsn = ssaVar.getAssign().getParentInsn();
+		if (constrInsn == null || constrInsn.getType() != InsnType.CONSTRUCTOR) {
+			return null;
+		}
+		FieldNode enumFieldNode = searchEnumField(cls, ssaVar, toRemove);
+		if (enumFieldNode == null) {
+			enumFieldNode = createFakeField(cls, "EF" + arg.getRegNum());
+			cls.addField(enumFieldNode);
+		}
+		return createEnumFieldByConstructor(cls, enumFieldNode, (ConstructorInsn) constrInsn);
+	}
+
+	private FieldNode createFakeField(ClassNode cls, String name) {
+		FieldNode enumFieldNode;
+		FieldInfo fldInfo = FieldInfo.from(cls.root(), cls.getClassInfo(), name, cls.getType());
+		enumFieldNode = new FieldNode(cls, fldInfo, 0);
+		enumFieldNode.add(AFlag.SYNTHETIC);
+		enumFieldNode.addAttr(AType.COMMENTS, "Fake field, exist only in values array");
+		return enumFieldNode;
+	}
+
+	@Nullable
+	private FieldNode searchEnumField(ClassNode cls, SSAVar ssaVar, List<InsnNode> toRemove) {
 		InsnNode sputInsn = ssaVar.getUseList().get(0).getParentInsn();
 		if (sputInsn == null || sputInsn.getType() != InsnType.SPUT) {
 			return null;
@@ -323,14 +366,8 @@ public class EnumVisitor extends AbstractVisitor {
 		if (enumFieldNode == null) {
 			return null;
 		}
-
-		InsnNode constrInsn = ssaVar.getAssign().getParentInsn();
-		if (constrInsn == null || constrInsn.getType() != InsnType.CONSTRUCTOR) {
-			return null;
-		}
 		toRemove.add(sputInsn);
-		toRemove.add(constrInsn);
-		return createEnumFieldByConstructor(cls, enumFieldNode, (ConstructorInsn) constrInsn);
+		return enumFieldNode;
 	}
 
 	private EnumField createEnumFieldByConstructor(ClassNode cls, FieldNode enumFieldNode, ConstructorInsn co) {

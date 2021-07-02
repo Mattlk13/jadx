@@ -5,6 +5,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -12,6 +13,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import jadx.api.ICodeCache;
+import jadx.api.ICodeWriter;
 import jadx.api.JadxArgs;
 import jadx.api.ResourceFile;
 import jadx.api.ResourceType;
@@ -20,6 +22,7 @@ import jadx.api.plugins.input.data.IClassData;
 import jadx.api.plugins.input.data.ILoadResult;
 import jadx.core.Jadx;
 import jadx.core.clsp.ClspGraph;
+import jadx.core.dex.attributes.AType;
 import jadx.core.dex.info.ClassInfo;
 import jadx.core.dex.info.ConstStorage;
 import jadx.core.dex.info.FieldInfo;
@@ -35,6 +38,7 @@ import jadx.core.dex.visitors.typeinference.TypeUpdate;
 import jadx.core.utils.CacheStorage;
 import jadx.core.utils.ErrorsCounter;
 import jadx.core.utils.StringUtils;
+import jadx.core.utils.Utils;
 import jadx.core.utils.android.AndroidResourcesUtils;
 import jadx.core.utils.exceptions.JadxRuntimeException;
 import jadx.core.xmlgen.ResTableParser;
@@ -58,16 +62,15 @@ public class RootNode {
 	private final MethodUtils methodUtils;
 	private final TypeUtils typeUtils;
 
-	private final ICodeCache codeCache;
-
-	private final List<ClassNode> classes = new ArrayList<>();
 	private final Map<ClassInfo, ClassNode> clsMap = new HashMap<>();
+	private List<ClassNode> classes = new ArrayList<>();
 
 	private ClspGraph clsp;
 	@Nullable
 	private String appPackage;
 	@Nullable
 	private ClassNode appResClass;
+	private boolean isProto;
 
 	public RootNode(JadxArgs args) {
 		this.args = args;
@@ -76,9 +79,9 @@ public class RootNode {
 		this.stringUtils = new StringUtils(args);
 		this.constValues = new ConstStorage(args);
 		this.typeUpdate = new TypeUpdate(this);
-		this.codeCache = args.getCodeCache();
 		this.methodUtils = new MethodUtils(this);
 		this.typeUtils = new TypeUtils(this);
+		this.isProto = args.getInputFiles().size() > 0 && args.getInputFiles().get(0).getName().toLowerCase().endsWith(".aab");
 	}
 
 	public void loadClasses(List<ILoadResult> loadedInputs) {
@@ -89,12 +92,29 @@ public class RootNode {
 				} catch (Exception e) {
 					addDummyClass(cls, e);
 				}
+				Utils.checkThreadInterrupt();
 			});
 		}
+		if (classes.size() != clsMap.size()) {
+			// class name duplication detected
+			classes.stream().collect(Collectors.groupingBy(ClassNode::getClassInfo))
+					.entrySet().stream()
+					.filter(entry -> entry.getValue().size() > 1)
+					.forEach(entry -> {
+						LOG.warn("Found duplicated class: {}, count: {}. Only one will be loaded!", entry.getKey(),
+								entry.getValue().size());
+						entry.getValue().forEach(cls -> cls.addAttr(AType.COMMENTS, "WARNING: Classes with same name are omitted"));
+					});
+		}
+		classes = new ArrayList<>(clsMap.values());
 		// sort classes by name, expect top classes before inner
 		classes.sort(Comparator.comparing(ClassNode::getFullName));
 		initInnerClasses();
-		LOG.debug("Classes loaded: {}", classes.size());
+
+		// print stats for loaded classes
+		int mthCount = classes.stream().mapToInt(c -> c.getMethods().size()).sum();
+		int insnsCount = classes.stream().flatMap(c -> c.getMethods().stream()).mapToInt(MethodNode::getInsnsCount).sum();
+		LOG.info("Loaded classes: {}, methods: {}, instructions: {}", classes.size(), mthCount, insnsCount);
 	}
 
 	private void addDummyClass(IClassData classData, Exception exc) {
@@ -167,16 +187,29 @@ public class RootNode {
 	}
 
 	private void updateObfuscatedFiles(ResTableParser parser, List<ResourceFile> resources) {
+		if (args.isSkipResources()) {
+			return;
+		}
+		long start = System.currentTimeMillis();
+		int renamedCount = 0;
 		ResourceStorage resStorage = parser.getResStorage();
-		ValuesParser valuesParser = new ValuesParser(this, parser.getStrings(), resStorage.getResourcesNames());
-		for (int i = 0; i < resources.size(); i++) {
-			ResourceFile resource = resources.get(i);
-			for (ResourceEntry ri : parser.getResStorage().getResources()) {
-				if (resource.getOriginalName().equals(valuesParser.getValueString(ri))) {
-					resource.setAlias(ri);
-					break;
-				}
+		ValuesParser valuesParser = new ValuesParser(parser.getStrings(), resStorage.getResourcesNames());
+		Map<String, ResourceEntry> entryNames = new HashMap<>();
+		for (ResourceEntry resEntry : resStorage.getResources()) {
+			String val = valuesParser.getSimpleValueString(resEntry);
+			if (val != null) {
+				entryNames.put(val, resEntry);
 			}
+		}
+		for (ResourceFile resource : resources) {
+			ResourceEntry resEntry = entryNames.get(resource.getOriginalName());
+			if (resEntry != null) {
+				resource.setAlias(resEntry);
+				renamedCount++;
+			}
+		}
+		if (LOG.isDebugEnabled()) {
+			LOG.debug("Renamed obfuscated resources: {}, duration: {}ms", renamedCount, System.currentTimeMillis() - start);
 		}
 	}
 
@@ -211,6 +244,7 @@ public class RootNode {
 
 	public void runPreDecompileStage() {
 		for (IDexTreeVisitor pass : preDecompilePasses) {
+			long start = System.currentTimeMillis();
 			try {
 				pass.init(this);
 			} catch (Exception e) {
@@ -218,6 +252,9 @@ public class RootNode {
 			}
 			for (ClassNode cls : classes) {
 				DepthTraversal.visit(pass, cls);
+			}
+			if (LOG.isDebugEnabled()) {
+				LOG.debug("{} time: {}ms", pass.getClass().getSimpleName(), System.currentTimeMillis() - start);
 			}
 		}
 	}
@@ -408,6 +445,11 @@ public class RootNode {
 		}
 	}
 
+	public ICodeWriter makeCodeWriter() {
+		JadxArgs jadxArgs = this.args;
+		return jadxArgs.getCodeWriterProvider().apply(jadxArgs);
+	}
+
 	public ClspGraph getClsp() {
 		return clsp;
 	}
@@ -421,6 +463,7 @@ public class RootNode {
 		return appPackage;
 	}
 
+	@Nullable
 	public ClassNode getAppResClass() {
 		return appResClass;
 	}
@@ -454,7 +497,7 @@ public class RootNode {
 	}
 
 	public ICodeCache getCodeCache() {
-		return codeCache;
+		return args.getCodeCache();
 	}
 
 	public MethodUtils getMethodUtils() {
@@ -463,5 +506,9 @@ public class RootNode {
 
 	public TypeUtils getTypeUtils() {
 		return typeUtils;
+	}
+
+	public boolean isProto() {
+		return isProto;
 	}
 }

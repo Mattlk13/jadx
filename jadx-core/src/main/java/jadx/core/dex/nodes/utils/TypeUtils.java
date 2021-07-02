@@ -7,11 +7,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
 
 import org.jetbrains.annotations.Nullable;
 
 import jadx.core.clsp.ClspClass;
 import jadx.core.dex.attributes.AType;
+import jadx.core.dex.attributes.nodes.ClassTypeVarsAttr;
 import jadx.core.dex.attributes.nodes.MethodTypeVarsAttr;
 import jadx.core.dex.attributes.nodes.NotificationAttrNode;
 import jadx.core.dex.instructions.BaseInvokeNode;
@@ -46,6 +48,19 @@ public class TypeUtils {
 		return generics == null ? Collections.emptyList() : generics;
 	}
 
+	@Nullable
+	public ClassTypeVarsAttr getClassTypeVars(ArgType type) {
+		ClassNode classNode = root.resolveClass(type);
+		if (classNode == null) {
+			return null;
+		}
+		ClassTypeVarsAttr typeVarsAttr = classNode.get(AType.CLASS_TYPE_VARS);
+		if (typeVarsAttr != null) {
+			return typeVarsAttr;
+		}
+		return buildClassTypeVarsAttr(classNode);
+	}
+
 	public ArgType expandTypeVariables(ClassNode cls, ArgType type) {
 		if (type.containsTypeVariable()) {
 			expandTypeVar(cls, type, cls.getGenericTypeParameters());
@@ -61,6 +76,9 @@ public class TypeUtils {
 	}
 
 	private void expandTypeVar(NotificationAttrNode node, ArgType type, Collection<ArgType> typeVars) {
+		if (typeVars.isEmpty()) {
+			return;
+		}
 		boolean allExtendsEmpty = true;
 		for (ArgType argType : typeVars) {
 			if (notEmpty(argType.getExtendTypes())) {
@@ -107,6 +125,26 @@ public class TypeUtils {
 	}
 
 	/**
+	 * Search for unknown type vars at current method. Return only first.
+	 *
+	 * @return unknown type var, null if not found
+	 */
+	@Nullable
+	public ArgType checkForUnknownTypeVars(MethodNode mth, ArgType checkType) {
+		Set<ArgType> knownTypeVars = getKnownTypeVarsAtMethod(mth);
+		return checkType.visitTypes(type -> {
+			if (type.isGenericType() && !knownTypeVars.contains(type)) {
+				return type;
+			}
+			return null;
+		});
+	}
+
+	public boolean containsUnknownTypeVar(MethodNode mth, ArgType type) {
+		return checkForUnknownTypeVars(mth, type) != null;
+	}
+
+	/**
 	 * Replace generic types in {@code typeWithGeneric} using instance types
 	 * <br>
 	 * Example:
@@ -118,21 +156,53 @@ public class TypeUtils {
 	 */
 	@Nullable
 	public ArgType replaceClassGenerics(ArgType instanceType, ArgType typeWithGeneric) {
-		if (typeWithGeneric == null) {
+		return replaceClassGenerics(instanceType, instanceType, typeWithGeneric);
+	}
+
+	@Nullable
+	public ArgType replaceClassGenerics(ArgType instanceType, ArgType genericSourceType, ArgType typeWithGeneric) {
+		if (typeWithGeneric == null || genericSourceType == null) {
 			return null;
 		}
-		Map<ArgType, ArgType> replaceMap = getTypeVariablesMapping(instanceType);
-		if (replaceMap.isEmpty()) {
-			return null;
+		Map<ArgType, ArgType> typeVarsMap = Collections.emptyMap();
+		ClassTypeVarsAttr typeVars = getClassTypeVars(instanceType);
+		if (typeVars != null) {
+			typeVarsMap = mergeTypeMaps(typeVarsMap, typeVars.getTypeVarsMapFor(genericSourceType));
 		}
-		return replaceTypeVariablesUsingMap(typeWithGeneric, replaceMap);
+		typeVarsMap = mergeTypeMaps(typeVarsMap, getTypeVariablesMapping(instanceType));
+		ArgType outerType = instanceType.getOuterType();
+		while (outerType != null) {
+			typeVarsMap = mergeTypeMaps(typeVarsMap, getTypeVariablesMapping(outerType));
+			outerType = outerType.getOuterType();
+		}
+		return replaceTypeVariablesUsingMap(typeWithGeneric, typeVarsMap);
+	}
+
+	private static Map<ArgType, ArgType> mergeTypeMaps(Map<ArgType, ArgType> base, Map<ArgType, ArgType> addition) {
+		if (base.isEmpty()) {
+			return addition;
+		}
+		if (addition.isEmpty()) {
+			return base;
+		}
+		Map<ArgType, ArgType> map = new HashMap<>(base.size() + addition.size());
+		for (Map.Entry<ArgType, ArgType> entry : base.entrySet()) {
+			ArgType value = entry.getValue();
+			ArgType type = addition.remove(value);
+			if (type != null) {
+				map.put(entry.getKey(), type);
+			} else {
+				map.put(entry.getKey(), entry.getValue());
+			}
+		}
+		map.putAll(addition);
+		return map;
 	}
 
 	public Map<ArgType, ArgType> getTypeVariablesMapping(ArgType clsType) {
 		if (!clsType.isGeneric()) {
 			return Collections.emptyMap();
 		}
-
 		List<ArgType> typeParameters = root.getTypeUtils().getClassGenerics(clsType);
 		if (typeParameters.isEmpty()) {
 			return Collections.emptyMap();
@@ -152,6 +222,30 @@ public class TypeUtils {
 			replaceMap.put(typeVar, actualType);
 		}
 		return replaceMap;
+	}
+
+	public Map<ArgType, ArgType> getTypeVarMappingForInvoke(BaseInvokeNode invokeInsn) {
+		IMethodDetails mthDetails = root.getMethodUtils().getMethodDetails(invokeInsn);
+		if (mthDetails == null) {
+			return Collections.emptyMap();
+		}
+		Map<ArgType, ArgType> map = new HashMap<>(1 + invokeInsn.getArgsCount());
+		addTypeVarMapping(map, mthDetails.getReturnType(), invokeInsn.getResult());
+		int argCount = Math.min(mthDetails.getArgTypes().size(), invokeInsn.getArgsCount());
+		for (int i = 0; i < argCount; i++) {
+			addTypeVarMapping(map, mthDetails.getArgTypes().get(i), invokeInsn.getArg(i));
+		}
+		return map;
+	}
+
+	private static void addTypeVarMapping(Map<ArgType, ArgType> map, ArgType typeVar, InsnArg arg) {
+		if (arg == null || typeVar == null || !typeVar.isTypeKnown()) {
+			return;
+		}
+		if (typeVar.isGenericType()) {
+			map.put(typeVar, arg.getType());
+		}
+		// TODO: resolve inner type vars: 'List<T> -> List<String>' to 'T -> String'
 	}
 
 	@Nullable
@@ -202,14 +296,72 @@ public class TypeUtils {
 			return ArgType.wildcard(newWildcardType, replaceType.getWildcardBound());
 		}
 
-		List<ArgType> genericTypes = replaceType.getGenericTypes();
-		if (replaceType.isGeneric() && notEmpty(genericTypes)) {
-			List<ArgType> newTypes = Utils.collectionMap(genericTypes, t -> {
-				ArgType type = replaceTypeVariablesUsingMap(t, replaceMap);
-				return type == null ? t : type;
-			});
-			return ArgType.generic(replaceType, newTypes);
+		if (replaceType.isGeneric()) {
+			ArgType outerType = replaceType.getOuterType();
+			if (outerType != null) {
+				ArgType replacedOuter = replaceTypeVariablesUsingMap(outerType, replaceMap);
+				if (replacedOuter == null) {
+					return null;
+				}
+				ArgType innerType = replaceType.getInnerType();
+				ArgType replacedInner = replaceTypeVariablesUsingMap(innerType, replaceMap);
+				return ArgType.outerGeneric(replacedOuter, replacedInner == null ? innerType : replacedInner);
+			}
+			List<ArgType> genericTypes = replaceType.getGenericTypes();
+			if (notEmpty(genericTypes)) {
+				List<ArgType> newTypes = Utils.collectionMap(genericTypes, t -> {
+					ArgType type = replaceTypeVariablesUsingMap(t, replaceMap);
+					return type == null ? t : type;
+				});
+				return ArgType.generic(replaceType, newTypes);
+			}
 		}
 		return null;
+	}
+
+	private ClassTypeVarsAttr buildClassTypeVarsAttr(ClassNode cls) {
+		Map<String, Map<ArgType, ArgType>> map = new HashMap<>();
+		ArgType currentClsType = cls.getClassInfo().getType();
+		map.put(currentClsType.getObject(), getTypeVariablesMapping(currentClsType));
+
+		cls.visitSuperTypes((parent, type) -> {
+			List<ArgType> currentVars = type.getGenericTypes();
+			if (Utils.isEmpty(currentVars)) {
+				return;
+			}
+			int varsCount = currentVars.size();
+			List<ArgType> sourceTypeVars = getClassGenerics(type);
+			if (varsCount == sourceTypeVars.size()) {
+				Map<ArgType, ArgType> parentTypeMap = map.get(parent.getObject());
+				Map<ArgType, ArgType> varsMap = new HashMap<>(varsCount);
+				for (int i = 0; i < varsCount; i++) {
+					ArgType currentTypeVar = currentVars.get(i);
+					ArgType resultType = parentTypeMap != null ? parentTypeMap.get(currentTypeVar) : null;
+					varsMap.put(sourceTypeVars.get(i), resultType != null ? resultType : currentTypeVar);
+				}
+				map.put(type.getObject(), varsMap);
+			}
+		});
+		List<ArgType> currentTypeVars = cls.getGenericTypeParameters();
+		ClassTypeVarsAttr typeVarsAttr = new ClassTypeVarsAttr(currentTypeVars, map);
+		cls.addAttr(typeVarsAttr);
+		return typeVarsAttr;
+	}
+
+	public void visitSuperTypes(ArgType type, BiConsumer<ArgType, ArgType> consumer) {
+		ClassNode cls = root.resolveClass(type);
+		if (cls != null) {
+			cls.visitSuperTypes(consumer);
+		} else {
+			ClspClass clspClass = root.getClsp().getClsDetails(type);
+			if (clspClass != null) {
+				for (ArgType superType : clspClass.getParents()) {
+					if (!superType.equals(ArgType.OBJECT)) {
+						consumer.accept(type, superType);
+						visitSuperTypes(superType, consumer);
+					}
+				}
+			}
+		}
 	}
 }

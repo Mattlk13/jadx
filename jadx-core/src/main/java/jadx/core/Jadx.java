@@ -11,8 +11,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import jadx.api.JadxArgs;
+import jadx.core.dex.visitors.AttachCommentsVisitor;
 import jadx.core.dex.visitors.AttachMethodDetails;
 import jadx.core.dex.visitors.AttachTryCatchVisitor;
+import jadx.core.dex.visitors.CheckCode;
 import jadx.core.dex.visitors.ClassModifier;
 import jadx.core.dex.visitors.ConstInlineVisitor;
 import jadx.core.dex.visitors.ConstructorVisitor;
@@ -71,8 +73,9 @@ public class Jadx {
 	}
 
 	public static List<IDexTreeVisitor> getFallbackPassesList() {
-		List<IDexTreeVisitor> passes = new ArrayList<>(3);
+		List<IDexTreeVisitor> passes = new ArrayList<>();
 		passes.add(new AttachTryCatchVisitor());
+		passes.add(new AttachCommentsVisitor());
 		passes.add(new ProcessInstructionsVisitor());
 		passes.add(new FallbackModeVisitor());
 		return passes;
@@ -81,8 +84,10 @@ public class Jadx {
 	public static List<IDexTreeVisitor> getPreDecompilePassesList() {
 		List<IDexTreeVisitor> passes = new ArrayList<>();
 		passes.add(new SignatureProcessor());
+		passes.add(new OverrideMethodVisitor());
 		passes.add(new RenameVisitor());
 		passes.add(new UsageInfoVisitor());
+		passes.add(new ProcessAnonymous());
 		return passes;
 	}
 
@@ -92,10 +97,12 @@ public class Jadx {
 		}
 
 		List<IDexTreeVisitor> passes = new ArrayList<>();
+		passes.add(new CheckCode());
 		if (args.isDebugInfo()) {
 			passes.add(new DebugInfoAttachVisitor());
 		}
 		passes.add(new AttachTryCatchVisitor());
+		passes.add(new AttachCommentsVisitor());
 		passes.add(new ProcessInstructionsVisitor());
 
 		passes.add(new BlockSplitter());
@@ -107,7 +114,6 @@ public class Jadx {
 		passes.add(new BlockFinish());
 
 		passes.add(new AttachMethodDetails());
-		passes.add(new OverrideMethodVisitor());
 
 		passes.add(new SSATransform());
 		passes.add(new MoveInlineVisitor());
@@ -119,8 +125,9 @@ public class Jadx {
 		if (args.isDebugInfo()) {
 			passes.add(new DebugInfoApplyVisitor());
 		}
-
-		passes.add(new InlineMethods());
+		if (args.isInlineMethods()) {
+			passes.add(new InlineMethods());
+		}
 		passes.add(new GenericTypesVisitor());
 		passes.add(new ShadowFieldVisitor());
 		passes.add(new DeboxingVisitor());
@@ -144,12 +151,12 @@ public class Jadx {
 		passes.add(new EnumVisitor());
 		passes.add(new ExtractFieldInit());
 		passes.add(new FixAccessModifiers());
-		passes.add(new ProcessAnonymous());
 		passes.add(new ClassModifier());
 		passes.add(new LoopRegionVisitor());
 
-		passes.add(new MarkMethodsForInline());
-
+		if (args.isInlineMethods()) {
+			passes.add(new MarkMethodsForInline());
+		}
 		passes.add(new ProcessVariables());
 		passes.add(new PrepareForCodeGen());
 		if (args.isCfgOutput()) {

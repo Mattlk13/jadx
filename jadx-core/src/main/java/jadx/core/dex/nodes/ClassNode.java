@@ -7,6 +7,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -23,8 +24,9 @@ import jadx.api.plugins.input.data.annotations.IAnnotation;
 import jadx.core.Consts;
 import jadx.core.ProcessClass;
 import jadx.core.dex.attributes.AFlag;
-import jadx.core.dex.attributes.FieldInitAttr;
 import jadx.core.dex.attributes.annotations.AnnotationsList;
+import jadx.core.dex.attributes.fldinit.FieldInitAttr;
+import jadx.core.dex.attributes.fldinit.FieldInitConstAttr;
 import jadx.core.dex.attributes.nodes.NotificationAttrNode;
 import jadx.core.dex.attributes.nodes.SourceFileAttr;
 import jadx.core.dex.info.AccessInfo;
@@ -34,7 +36,7 @@ import jadx.core.dex.info.FieldInfo;
 import jadx.core.dex.info.MethodInfo;
 import jadx.core.dex.instructions.args.ArgType;
 import jadx.core.dex.instructions.args.LiteralArg;
-import jadx.core.dex.visitors.ProcessAnonymous;
+import jadx.core.dex.nodes.utils.TypeUtils;
 import jadx.core.utils.Utils;
 import jadx.core.utils.exceptions.JadxRuntimeException;
 
@@ -68,11 +70,17 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 	private volatile ProcessState state = ProcessState.NOT_LOADED;
 	private LoadStage loadStage = LoadStage.NONE;
 
-	/** Top level classes used in this class (only for top level classes, empty for inners) */
+	/**
+	 * Top level classes used in this class (only for top level classes, empty for inners)
+	 */
 	private List<ClassNode> dependencies = Collections.emptyList();
-	/** Classes which uses this class */
+	/**
+	 * Classes which uses this class
+	 */
 	private List<ClassNode> useIn = Collections.emptyList();
-	/** Methods which uses this class (by instructions only, definition is excluded) */
+	/**
+	 * Methods which uses this class (by instructions only, definition is excluded)
+	 */
 	private List<MethodNode> useInMth = Collections.emptyList();
 
 	// cache maps
@@ -164,19 +172,23 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 		for (FieldNode f : staticFields) {
 			if (f.getAccessFlags().isFinal()) {
 				// incorrect initialization will be removed if assign found in constructor
-				f.addAttr(FieldInitAttr.NULL_VALUE);
+				f.addAttr(FieldInitConstAttr.NULL_VALUE);
 			}
 		}
-		List<EncodedValue> values = cls.getStaticFieldInitValues();
-		int count = values.size();
-		if (count == 0 || count > staticFields.size()) {
-			return;
+		try {
+			List<EncodedValue> values = cls.getStaticFieldInitValues();
+			int count = values.size();
+			if (count == 0 || count > staticFields.size()) {
+				return;
+			}
+			for (int i = 0; i < count; i++) {
+				staticFields.get(i).addAttr(FieldInitAttr.constValue(values.get(i)));
+			}
+			// process const fields
+			root().getConstValues().processConstFields(this, staticFields);
+		} catch (Exception e) {
+			this.addWarnComment("Failed to load initial values for static fields", e);
 		}
-		for (int i = 0; i < count; i++) {
-			staticFields.get(i).addAttr(FieldInitAttr.constValue(values.get(i)));
-		}
-		// process const fields
-		root().getConstValues().processConstFields(this, staticFields);
 	}
 
 	private void addSourceFilenameAttr(String fileName) {
@@ -186,9 +198,7 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 		if (fileName.endsWith(".java")) {
 			fileName = fileName.substring(0, fileName.length() - 5);
 		}
-		if (fileName.isEmpty()
-				|| fileName.equals("SourceFile")
-				|| fileName.equals("\"")) {
+		if (fileName.isEmpty() || fileName.equals("SourceFile")) {
 			return;
 		}
 		if (clsInfo != null) {
@@ -196,12 +206,7 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 			if (fileName.equals(name)) {
 				return;
 			}
-			if (fileName.contains("$")
-					&& fileName.endsWith('$' + name)) {
-				return;
-			}
-			ClassInfo parentCls = clsInfo.getTopParentClass();
-			if (parentCls != null && fileName.equals(parentCls.getShortName())) {
+			if (fileName.contains("$") && fileName.endsWith('$' + name)) {
 				return;
 			}
 		}
@@ -235,14 +240,12 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 			// manually added class
 			return;
 		}
+		unload();
 		clearAttributes();
 		root().getConstValues().removeForClass(this);
 		initialLoad(clsData);
-		ProcessAnonymous.runForClass(this);
 
-		for (ClassNode innerClass : innerClasses) {
-			innerClass.deepUnload();
-		}
+		innerClasses.forEach(ClassNode::deepUnload);
 	}
 
 	private synchronized ICodeInfo decompile(boolean searchInCache) {
@@ -325,6 +328,10 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 		return fields;
 	}
 
+	public void addField(FieldNode fld) {
+		fields.add(fld);
+	}
+
 	public FieldNode getConstField(Object obj) {
 		return getConstField(obj, true);
 	}
@@ -360,6 +367,15 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 	public FieldNode searchFieldByName(String name) {
 		for (FieldNode f : fields) {
 			if (f.getName().equals(name)) {
+				return f;
+			}
+		}
+		return null;
+	}
+
+	public FieldNode searchFieldByShortId(String shortId) {
+		for (FieldNode f : fields) {
+			if (f.getFieldInfo().getShortId().equals(shortId)) {
 				return f;
 			}
 		}
@@ -418,6 +434,19 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 			consumer.accept(parentCls);
 			currentCls = parentCls;
 			parentCls = currentCls.getParentClass();
+		}
+	}
+
+	public void visitSuperTypes(BiConsumer<ArgType, ArgType> consumer) {
+		TypeUtils typeUtils = root.getTypeUtils();
+		ArgType thisType = this.getType();
+		if (!superClass.equals(ArgType.OBJECT)) {
+			consumer.accept(thisType, superClass);
+			typeUtils.visitSuperTypes(superClass, consumer);
+		}
+		for (ArgType iface : interfaces) {
+			consumer.accept(thisType, iface);
+			typeUtils.visitSuperTypes(iface, consumer);
 		}
 	}
 
@@ -567,6 +596,10 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 		sb.append(this.clsData.getDisassembledCode());
 	}
 
+	public IClassData getClsData() {
+		return clsData;
+	}
+
 	public ProcessState getState() {
 		return state;
 	}
@@ -586,7 +619,7 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 	public void reloadAtCodegenStage() {
 		ClassNode topCls = this.getTopParentClass();
 		if (topCls.getLoadStage() == LoadStage.CODEGEN_STAGE) {
-			throw new JadxRuntimeException("Class not yet loaded at codegen stage");
+			throw new JadxRuntimeException("Class not yet loaded at codegen stage: " + topCls);
 		}
 		topCls.add(AFlag.RELOAD_AT_CODEGEN_STAGE);
 	}
@@ -646,5 +679,4 @@ public class ClassNode extends NotificationAttrNode implements ILoadable, ICodeN
 	public String toString() {
 		return clsInfo.getFullName();
 	}
-
 }

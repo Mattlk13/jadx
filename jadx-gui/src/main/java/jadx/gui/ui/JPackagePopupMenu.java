@@ -1,5 +1,6 @@
 package jadx.gui.ui;
 
+import java.awt.event.ActionEvent;
 import java.util.Arrays;
 import java.util.List;
 
@@ -25,6 +26,7 @@ class JPackagePopupMenu extends JPopupMenu {
 		this.mainWindow = mainWindow;
 
 		add(makeExcludeItem(pkg));
+		add(makeExcludeItem());
 		JMenuItem menuItem = makeRenameMenuItem(pkg);
 		if (menuItem != null) {
 			add(menuItem);
@@ -79,7 +81,7 @@ class JPackagePopupMenu extends JPopupMenu {
 
 	private void rename(JPackage pkg) {
 		LOG.debug("Renaming package: fullName={}, name={}", pkg.getFullName(), pkg.getName());
-		new RenameDialog(mainWindow, pkg).setVisible(true);
+		RenameDialog.rename(mainWindow, pkg);
 	}
 
 	private List<String> splitPackage(String rawPackage) {
@@ -87,8 +89,9 @@ class JPackagePopupMenu extends JPopupMenu {
 	}
 
 	private String getRawPackage(JPackage pkg) {
-		for (JClass cls : pkg.getClasses()) {
-			return cls.getRootClass().getCls().getClassNode().getClassInfo().getPackage();
+		List<JClass> classes = pkg.getClasses();
+		if (!classes.isEmpty()) {
+			return classes.get(0).getRootClass().getCls().getClassNode().getClassInfo().getPackage();
 		}
 		for (JPackage innerPkg : pkg.getInnerPackages()) {
 			String rawPackage = getRawPackage(innerPkg);
@@ -113,5 +116,16 @@ class JPackagePopupMenu extends JPopupMenu {
 			mainWindow.reOpenFile();
 		});
 		return excludeItem;
+	}
+
+	private JMenuItem makeExcludeItem() {
+		return new JMenuItem(new AbstractAction(NLS.str("popup.exclude_packages")) {
+			private static final long serialVersionUID = -1111111202104151028L;
+
+			@Override
+			public void actionPerformed(ActionEvent e) {
+				new ExcludePkgDialog(mainWindow).setVisible(true);
+			}
+		});
 	}
 }

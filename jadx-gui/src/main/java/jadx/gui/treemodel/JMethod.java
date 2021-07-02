@@ -5,10 +5,16 @@ import java.util.Iterator;
 import javax.swing.Icon;
 import javax.swing.ImageIcon;
 
+import org.fife.ui.rsyntaxtextarea.SyntaxConstants;
+
 import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
+import jadx.core.dex.attributes.AFlag;
 import jadx.core.dex.info.AccessInfo;
 import jadx.core.dex.instructions.args.ArgType;
+import jadx.gui.ui.ContentPanel;
+import jadx.gui.ui.TabbedPane;
+import jadx.gui.ui.codearea.ClassCodeContentPanel;
 import jadx.gui.utils.OverlayIcon;
 import jadx.gui.utils.UiUtils;
 
@@ -36,6 +42,10 @@ public class JMethod extends JNode {
 		return mth;
 	}
 
+	public JavaMethod getJavaMethod() {
+		return mth;
+	}
+
 	@Override
 	public JClass getJParent() {
 		return jParent;
@@ -56,6 +66,11 @@ public class JMethod extends JNode {
 	}
 
 	@Override
+	public ContentPanel getContentPanel(TabbedPane tabbedPane) {
+		return new ClassCodeContentPanel(tabbedPane, this);
+	}
+
+	@Override
 	public Icon getIcon() {
 		AccessInfo accessFlags = mth.getAccessFlags();
 		OverlayIcon icon = UiUtils.makeIcon(accessFlags, ICON_MTH_PUB, ICON_MTH_PRI, ICON_MTH_PRO, ICON_MTH_DEF);
@@ -66,6 +81,16 @@ public class JMethod extends JNode {
 			icon.add(ICON_SYNC);
 		}
 		return icon;
+	}
+
+	@Override
+	public String getSyntaxName() {
+		return SyntaxConstants.SYNTAX_STYLE_JAVA;
+	}
+
+	@Override
+	public boolean canRename() {
+		return !mth.getMethodNode().contains(AFlag.DONT_RENAME);
 	}
 
 	String makeBaseString() {

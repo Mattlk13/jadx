@@ -1,13 +1,9 @@
 package jadx.gui.ui;
 
-import java.awt.*;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.awt.BorderLayout;
+import java.awt.Container;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -15,34 +11,51 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import javax.swing.*;
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JDialog;
+import javax.swing.JLabel;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JTextField;
+import javax.swing.SwingConstants;
+import javax.swing.WindowConstants;
 
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import jadx.api.ICodeWriter;
 import jadx.api.JavaClass;
 import jadx.api.JavaField;
 import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
-import jadx.core.codegen.CodeWriter;
+import jadx.core.deobf.DeobfPresets;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.attributes.nodes.MethodOverrideAttr;
+import jadx.core.dex.nodes.MethodNode;
 import jadx.core.dex.nodes.RootNode;
+import jadx.core.dex.nodes.VariableNode;
 import jadx.core.dex.visitors.RenameVisitor;
 import jadx.core.utils.Utils;
 import jadx.core.utils.exceptions.JadxRuntimeException;
-import jadx.gui.jobs.IndexJob;
+import jadx.gui.jobs.TaskStatus;
 import jadx.gui.settings.JadxSettings;
 import jadx.gui.treemodel.JClass;
 import jadx.gui.treemodel.JField;
 import jadx.gui.treemodel.JMethod;
 import jadx.gui.treemodel.JNode;
 import jadx.gui.treemodel.JPackage;
+import jadx.gui.treemodel.JVariable;
 import jadx.gui.ui.codearea.ClassCodeContentPanel;
-import jadx.gui.ui.codearea.CodePanel;
+import jadx.gui.ui.codearea.CodeArea;
 import jadx.gui.utils.CacheObject;
 import jadx.gui.utils.JNodeCache;
 import jadx.gui.utils.NLS;
 import jadx.gui.utils.TextStandardActions;
+import jadx.gui.utils.UiUtils;
 
 public class RenameDialog extends JDialog {
 	private static final long serialVersionUID = -3269715644416902410L;
@@ -54,28 +67,35 @@ public class RenameDialog extends JDialog {
 	private final transient JNode node;
 	private transient JTextField renameField;
 
-	public RenameDialog(MainWindow mainWindow, JNode node) {
+	public static boolean rename(MainWindow mainWindow, JNode node) {
+		if (!checkSettings(mainWindow)) {
+			return false;
+		}
+		RenameDialog renameDialog = new RenameDialog(mainWindow, node);
+		renameDialog.setVisible(true);
+		return true;
+	}
+
+	private RenameDialog(MainWindow mainWindow, JNode node) {
 		super(mainWindow);
 		this.mainWindow = mainWindow;
 		this.cache = mainWindow.getCacheObject();
 		this.node = node;
-		if (checkSettings()) {
-			initUI();
-		}
+		initUI();
 	}
 
-	private boolean checkSettings() {
+	public static boolean checkSettings(MainWindow mainWindow) {
 		StringBuilder errorMessage = new StringBuilder();
-		errorMessage.append(NLS.str("msg.rename_disabled")).append(CodeWriter.NL);
+		errorMessage.append(NLS.str("msg.rename_disabled")).append(ICodeWriter.NL);
 
 		JadxSettings settings = mainWindow.getSettings();
 		boolean valid = true;
 		if (!settings.isDeobfuscationOn()) {
-			errorMessage.append(" - ").append(NLS.str("msg.rename_disabled_deobfuscation_disabled")).append(CodeWriter.NL);
+			errorMessage.append(" - ").append(NLS.str("msg.rename_disabled_deobfuscation_disabled")).append(ICodeWriter.NL);
 			valid = false;
 		}
 		if (settings.isDeobfuscationForceSave()) {
-			errorMessage.append(" - ").append(NLS.str("msg.rename_disabled_force_rewrite_enabled")).append(CodeWriter.NL);
+			errorMessage.append(" - ").append(NLS.str("msg.rename_disabled_force_rewrite_enabled")).append(ICodeWriter.NL);
 			valid = false;
 		}
 		if (valid) {
@@ -94,80 +114,28 @@ public class RenameDialog extends JDialog {
 		return false; // TODO: can't open dialog, 'node' is replaced with new one after reopen
 	}
 
-	private Path getDeobfMapPath(RootNode root) {
-		List<File> inputFiles = root.getArgs().getInputFiles();
-		if (inputFiles.isEmpty()) {
-			return null;
-		}
-		File firstInputFile = inputFiles.get(0);
-		Path inputFilePath = firstInputFile.getAbsoluteFile().toPath();
-
-		String inputName = inputFilePath.getFileName().toString();
-		String baseName = inputName.substring(0, inputName.lastIndexOf('.'));
-		return inputFilePath.getParent().resolve(baseName + ".jobf");
-	}
-
-	private String getNodeAlias(String renameText) {
-		String type = "";
-		String id = "";
+	private void updateDeobfMap(DeobfPresets deobfPresets, String renameText) {
 		if (node instanceof JMethod) {
-			JavaMethod javaMethod = (JavaMethod) node.getJavaNode();
-			type = "m";
-			id = javaMethod.getMethodNode().getMethodInfo().getRawFullId();
+			MethodNode mthNode = ((JavaMethod) node.getJavaNode()).getMethodNode();
+			MethodOverrideAttr overrideAttr = mthNode.get(AType.METHOD_OVERRIDE);
+			if (overrideAttr != null) {
+				for (MethodNode relatedMth : overrideAttr.getRelatedMthNodes()) {
+					deobfPresets.getMthPresetMap().put(relatedMth.getMethodInfo().getRawFullId(), renameText);
+				}
+			}
+			deobfPresets.getMthPresetMap().put(mthNode.getMethodInfo().getRawFullId(), renameText);
 		} else if (node instanceof JField) {
 			JavaField javaField = (JavaField) node.getJavaNode();
-			type = "f";
-			id = javaField.getFieldNode().getFieldInfo().getRawFullId();
+			deobfPresets.getFldPresetMap().put(javaField.getFieldNode().getFieldInfo().getRawFullId(), renameText);
 		} else if (node instanceof JClass) {
 			JavaClass javaClass = (JavaClass) node.getJavaNode();
-			type = "c";
-			id = javaClass.getRawName();
+			deobfPresets.getClsPresetMap().put(javaClass.getRawName(), renameText);
 		} else if (node instanceof JPackage) {
-			type = "p";
-			id = ((JPackage) node).getFullName();
+			deobfPresets.getPkgPresetMap().put(((JPackage) node).getFullName(), renameText);
+		} else if (node instanceof JVariable) {
+			VariableNode varNode = ((JVariable) node).getJavaVarNode().getVariableNode();
+			deobfPresets.updateVariableName(varNode, renameText);
 		}
-		return String.format("%s %s = %s", type, id, renameText);
-	}
-
-	private void writeDeobfMapFile(Path deobfMapPath, List<String> deobfMap) throws IOException {
-		if (deobfMapPath == null) {
-			LOG.error("updateDeobfMapFile(): deobfMapPath is null!");
-			return;
-		}
-		File tmpFile = File.createTempFile("deobf_tmp_", ".txt");
-		try (FileOutputStream fileOut = new FileOutputStream(tmpFile)) {
-			for (String entry : deobfMap) {
-				fileOut.write(entry.getBytes(StandardCharsets.UTF_8));
-				fileOut.write(System.lineSeparator().getBytes(StandardCharsets.UTF_8));
-			}
-		}
-		File oldMap = File.createTempFile("deobf_bak_", ".txt");
-		Files.copy(deobfMapPath, oldMap.toPath(), StandardCopyOption.REPLACE_EXISTING);
-		LOG.trace("Copying " + tmpFile.toPath() + " to " + deobfMapPath);
-		Files.copy(tmpFile.toPath(), deobfMapPath, StandardCopyOption.REPLACE_EXISTING);
-		Files.delete(oldMap.toPath());
-		Files.delete(tmpFile.toPath());
-	}
-
-	@NotNull
-	private List<String> readDeobfMap(Path deobfMapPath) throws IOException {
-		return Files.readAllLines(deobfMapPath, StandardCharsets.UTF_8);
-	}
-
-	private List<String> updateDeobfMap(List<String> deobfMap, String alias) {
-		String id = alias.substring(0, alias.indexOf('=') + 1);
-		int i = 0;
-		while (i < deobfMap.size()) {
-			if (deobfMap.get(i).startsWith(id)) {
-				LOG.debug("updateDeobfMap(): Removing entry " + deobfMap.get(i));
-				deobfMap.remove(i);
-			} else {
-				i++;
-			}
-		}
-		LOG.debug("updateDeobfMap(): Placing alias = " + alias);
-		deobfMap.add(alias);
-		return deobfMap;
 	}
 
 	private void rename() {
@@ -195,18 +163,20 @@ public class RenameDialog extends JDialog {
 	}
 
 	private boolean refreshDeobfMapFile(String renameText, RootNode root) {
-		List<String> deobfMap;
-		Path deobfMapPath = getDeobfMapPath(root);
+		DeobfPresets deobfPresets = DeobfPresets.build(root);
+		if (deobfPresets == null) {
+			return false;
+		}
 		try {
-			deobfMap = readDeobfMap(deobfMapPath);
-		} catch (IOException e) {
+			deobfPresets.load();
+		} catch (Exception e) {
 			LOG.error("rename(): readDeobfMap() failed");
 			return false;
 		}
-		updateDeobfMap(deobfMap, getNodeAlias(renameText));
+		updateDeobfMap(deobfPresets, renameText);
 		try {
-			writeDeobfMapFile(deobfMapPath, deobfMap);
-		} catch (IOException e) {
+			deobfPresets.save();
+		} catch (Exception e) {
 			LOG.error("rename(): writeDeobfMap() failed");
 			return false;
 		}
@@ -224,6 +194,9 @@ public class RenameDialog extends JDialog {
 		if (javaNode != null) {
 			toUpdate.add(javaNode);
 			toUpdate.addAll(javaNode.getUseIn());
+			if (node instanceof JMethod) {
+				toUpdate.addAll(((JMethod) node).getJavaMethod().getOverrideRelatedMethods());
+			}
 		} else if (node instanceof JPackage) {
 			processPackage(toUpdate);
 		} else {
@@ -243,13 +216,15 @@ public class RenameDialog extends JDialog {
 		if (!updatedTopClasses.isEmpty()) {
 			mainWindow.getBackgroundExecutor().execute("Refreshing",
 					Utils.collectionMap(updatedTopClasses, cls -> () -> refreshJClass(cls)),
-					() -> {
-						if (node instanceof JPackage) {
-							// reinit tree
-							mainWindow.initTree();
-						} else {
-							mainWindow.reloadTree();
+					(status) -> {
+						if (status == TaskStatus.CANCEL_BY_MEMORY) {
+							mainWindow.showHeapUsageBar();
+							UiUtils.errorMessage(this, NLS.str("message.memoryLow"));
 						}
+						if (node instanceof JPackage) {
+							mainWindow.getTreeRoot().update();
+						}
+						mainWindow.reloadTree();
 					});
 		}
 	}
@@ -271,25 +246,19 @@ public class RenameDialog extends JDialog {
 	private void refreshJClass(JClass cls) {
 		try {
 			cls.reload();
-			IndexJob.refreshIndex(cache, cls.getCls());
-		} catch (Throwable e) {
-			LOG.error("Failed to reload class: {}", cls, e);
+			cache.getIndexService().refreshIndex(cls.getCls());
+		} catch (Exception e) {
+			LOG.error("Failed to reload class: {}", cls.getFullName(), e);
 		}
 	}
 
 	private void refreshTabs(TabbedPane tabbedPane, Set<JClass> updatedClasses) {
 		for (Map.Entry<JNode, ContentPanel> entry : tabbedPane.getOpenTabs().entrySet()) {
-			ContentPanel contentPanel = entry.getValue();
-			if (contentPanel instanceof ClassCodeContentPanel) {
-				JNode node = entry.getKey();
-				JClass rootClass = node.getRootClass();
-				if (updatedClasses.contains(rootClass)) {
-					refreshJClass(rootClass);
-					ClassCodeContentPanel codePanel = (ClassCodeContentPanel) contentPanel;
-					CodePanel javaPanel = codePanel.getJavaCodePanel();
-					javaPanel.refresh();
-					tabbedPane.refresh(rootClass);
-				}
+			JClass rootClass = entry.getKey().getRootClass();
+			if (updatedClasses.remove(rootClass)) {
+				ClassCodeContentPanel contentPanel = (ClassCodeContentPanel) entry.getValue();
+				CodeArea codeArea = (CodeArea) contentPanel.getJavaCodePanel().getCodeArea();
+				codeArea.refreshClass();
 			}
 		}
 	}
@@ -298,7 +267,7 @@ public class RenameDialog extends JDialog {
 	protected JPanel initButtonsPanel() {
 		JButton cancelButton = new JButton(NLS.str("search_dialog.cancel"));
 		cancelButton.addActionListener(event -> dispose());
-		JButton renameBtn = new JButton(NLS.str("popup.rename"));
+		JButton renameBtn = new JButton(NLS.str("common_dialog.ok"));
 		renameBtn.addActionListener(event -> rename());
 		getRootPane().setDefaultButton(renameBtn);
 
@@ -352,6 +321,7 @@ public class RenameDialog extends JDialog {
 		setLocationRelativeTo(null);
 		setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
 		setModalityType(ModalityType.APPLICATION_MODAL);
+		UiUtils.addEscapeShortCutToDispose(this);
 	}
 
 	@Override

@@ -6,6 +6,8 @@ import java.util.Set;
 
 import jadx.core.dex.attributes.annotations.AnnotationsList;
 import jadx.core.dex.attributes.annotations.MethodParameters;
+import jadx.core.dex.attributes.fldinit.FieldInitAttr;
+import jadx.core.dex.attributes.nodes.ClassTypeVarsAttr;
 import jadx.core.dex.attributes.nodes.DeclareVariablesAttr;
 import jadx.core.dex.attributes.nodes.EdgeInsnAttr;
 import jadx.core.dex.attributes.nodes.EnumClassAttr;
@@ -41,6 +43,9 @@ import jadx.core.dex.trycatch.SplitterBlockAttr;
 @SuppressWarnings("InstantiationOfUtilityClass")
 public class AType<T extends IAttribute> {
 
+	// class, method, field, insn
+	public static final AType<AttrList<String>> CODE_COMMENTS = new AType<>();
+
 	// class, method, field
 	public static final AType<AnnotationsList> ANNOTATION_LIST = new AType<>();
 	public static final AType<RenameReasonAttr> RENAME_REASON = new AType<>();
@@ -54,6 +59,7 @@ public class AType<T extends IAttribute> {
 	public static final AType<SourceFileAttr> SOURCE_FILE = new AType<>();
 	public static final AType<EnumClassAttr> ENUM_CLASS = new AType<>();
 	public static final AType<EnumMapAttr> ENUM_MAP = new AType<>();
+	public static final AType<ClassTypeVarsAttr> CLASS_TYPE_VARS = new AType<>();
 
 	// field
 	public static final AType<FieldInitAttr> FIELD_INIT = new AType<>();
@@ -92,7 +98,12 @@ public class AType<T extends IAttribute> {
 	public static final AType<RegDebugInfoAttr> REG_DEBUG_INFO = new AType<>();
 
 	public static final Set<AType<?>> SKIP_ON_UNLOAD = new HashSet<>(Arrays.asList(
+			SOURCE_FILE,
+			ANNOTATION_LIST,
+			ANNOTATION_MTH_PARAMETERS,
+			FIELD_INIT,
 			FIELD_REPLACE,
 			METHOD_INLINE,
+			METHOD_OVERRIDE,
 			SKIP_MTH_ARGS));
 }

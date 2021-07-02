@@ -10,6 +10,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -110,7 +111,7 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 	/**
 	 * Check if all types resolved
 	 */
-	private boolean checkTypes(MethodNode mth) {
+	private static boolean checkTypes(MethodNode mth) {
 		for (SSAVar var : mth.getSVars()) {
 			ArgType type = var.getTypeInfo().getType();
 			if (!type.isTypeKnown()) {
@@ -209,7 +210,7 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 				if (ssaVar.getTypeInfo().getType().equals(candidateType)) {
 					LOG.info("Same type rejected: {} -> {}, bounds: {}", ssaVar, candidateType, bounds);
 				} else if (candidateType.isTypeKnown()) {
-					LOG.debug("Type set rejected: {} -> {}, bounds: {}", ssaVar, candidateType, bounds);
+					LOG.debug("Type rejected: {} -> {}, bounds: {}", ssaVar, candidateType, bounds);
 				}
 			}
 			return false;
@@ -292,6 +293,10 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 				addBound(typeInfo, makeAssignInvokeBound((InvokeNode) insn));
 				break;
 
+			case IGET:
+				addBound(typeInfo, makeAssignFieldGetBound((IndexInsnNode) insn));
+				break;
+
 			case CHECK_CAST:
 				addBound(typeInfo, new TypeBoundCheckCastAssign(root, (IndexInsnNode) insn));
 				break;
@@ -301,6 +306,14 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 				addBound(typeInfo, new TypeBoundConst(BoundEnum.ASSIGN, type));
 				break;
 		}
+	}
+
+	private ITypeBound makeAssignFieldGetBound(IndexInsnNode insn) {
+		ArgType initType = insn.getResult().getInitType();
+		if (initType.containsTypeVariable()) {
+			return new TypeBoundFieldGetAssign(root, insn, initType);
+		}
+		return new TypeBoundConst(BoundEnum.ASSIGN, initType);
 	}
 
 	private ITypeBound makeAssignInvokeBound(InvokeNode invokeNode) {
@@ -331,6 +344,10 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 			if (invokeUseBound != null) {
 				return invokeUseBound;
 			}
+		}
+		if (insn.getType() == InsnType.CHECK_CAST && insn.contains(AFlag.SOFT_CAST)) {
+			// ignore
+			return null;
 		}
 		return new TypeBoundConst(BoundEnum.USE, regArg.getInitType(), regArg);
 	}
@@ -495,34 +512,77 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 	private int tryInsertVarCast(MethodNode mth, SSAVar var) {
 		for (ITypeBound bound : var.getTypeInfo().getBounds()) {
 			ArgType boundType = bound.getType();
-			if (boundType.isTypeKnown() && boundType.containsTypeVariable()) {
+			if (boundType.isTypeKnown()
+					&& !boundType.equals(var.getTypeInfo().getType())
+					&& boundType.containsTypeVariable()
+					&& !root.getTypeUtils().containsUnknownTypeVar(mth, boundType)) {
 				if (insertAssignCast(mth, var, boundType)) {
 					return 1;
 				}
-				// TODO: check if use casts are needed
-				return 0;
+				return insertUseCasts(mth, var);
 			}
 		}
 		return 0;
 	}
 
+	private int insertUseCasts(MethodNode mth, SSAVar var) {
+		List<RegisterArg> useList = var.getUseList();
+		if (useList.isEmpty()) {
+			return 0;
+		}
+		int useCasts = 0;
+		for (RegisterArg useReg : new ArrayList<>(useList)) {
+			if (insertSoftUseCast(mth, useReg)) {
+				useCasts++;
+			}
+		}
+		return useCasts;
+	}
+
 	private boolean insertAssignCast(MethodNode mth, SSAVar var, ArgType castType) {
 		RegisterArg assignArg = var.getAssign();
 		InsnNode assignInsn = assignArg.getParentInsn();
+		if (assignInsn == null || assignInsn.getType() == InsnType.PHI) {
+			return false;
+		}
 		BlockNode assignBlock = BlockUtils.getBlockByInsn(mth, assignInsn);
 		if (assignBlock == null) {
 			return false;
 		}
 		RegisterArg newAssignArg = assignArg.duplicateWithNewSSAVar(mth);
 		assignInsn.setResult(newAssignArg);
+		IndexInsnNode castInsn = makeSoftCastInsn(assignArg, newAssignArg, castType);
+		return BlockUtils.insertAfterInsn(assignBlock, assignInsn, castInsn);
+	}
 
+	private boolean insertSoftUseCast(MethodNode mth, RegisterArg useArg) {
+		InsnNode useInsn = useArg.getParentInsn();
+		if (useInsn == null || useInsn.getType() == InsnType.PHI) {
+			return false;
+		}
+		if (useInsn.getType() == InsnType.IF && useInsn.getArg(1).isZeroLiteral()) {
+			// cast not needed if compare with null
+			return false;
+		}
+		BlockNode useBlock = BlockUtils.getBlockByInsn(mth, useInsn);
+		if (useBlock == null) {
+			return false;
+		}
+		RegisterArg newUseArg = useArg.duplicateWithNewSSAVar(mth);
+		useInsn.replaceArg(useArg, newUseArg);
+
+		IndexInsnNode castInsn = makeSoftCastInsn(newUseArg, useArg, useArg.getInitType());
+		return BlockUtils.insertBeforeInsn(useBlock, useInsn, castInsn);
+	}
+
+	@NotNull
+	private IndexInsnNode makeSoftCastInsn(RegisterArg result, RegisterArg arg, ArgType castType) {
 		IndexInsnNode castInsn = new IndexInsnNode(InsnType.CHECK_CAST, castType, 1);
-		castInsn.setResult(assignArg.duplicate());
-		castInsn.addArg(newAssignArg.duplicate());
+		castInsn.setResult(result.duplicate());
+		castInsn.addArg(arg.duplicate());
 		castInsn.add(AFlag.SOFT_CAST);
 		castInsn.add(AFlag.SYNTHETIC);
-
-		return BlockUtils.insertAfterInsn(assignBlock, assignInsn, castInsn);
+		return castInsn;
 	}
 
 	private boolean trySplitConstInsns(MethodNode mth) {
@@ -541,6 +601,10 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 	}
 
 	private boolean checkAndSplitConstInsn(MethodNode mth, SSAVar var) {
+		ArgType type = var.getTypeInfo().getType();
+		if (type.isTypeKnown() || var.isTypeImmutable()) {
+			return false;
+		}
 		if (var.getUsedInPhi().size() < 2) {
 			return false;
 		}
@@ -738,15 +802,20 @@ public final class TypeInferenceVisitor extends AbstractVisitor {
 		if (typeInfo.getType().isTypeKnown()) {
 			return false;
 		}
-		boolean boolAssign = false;
 		for (ITypeBound bound : typeInfo.getBounds()) {
-			if (bound.getBound() == BoundEnum.ASSIGN && bound.getType().equals(ArgType.BOOLEAN)) {
-				boolAssign = true;
-				break;
+			ArgType boundType = bound.getType();
+			switch (bound.getBound()) {
+				case ASSIGN:
+					if (!boundType.contains(PrimitiveType.BOOLEAN)) {
+						return false;
+					}
+					break;
+				case USE:
+					if (!boundType.canBeAnyNumber()) {
+						return false;
+					}
+					break;
 			}
-		}
-		if (!boolAssign) {
-			return false;
 		}
 
 		boolean fixed = false;

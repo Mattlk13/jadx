@@ -7,6 +7,7 @@ import java.util.Objects;
 import java.util.function.Function;
 
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 
 import jadx.core.Consts;
@@ -676,6 +677,18 @@ public abstract class ArgType {
 				|| (!isTypeKnown() && contains(primitiveType));
 	}
 
+	public boolean canBeAnyNumber() {
+		if (isPrimitive()) {
+			return !getPrimitiveType().isObjectOrArray();
+		}
+		for (PrimitiveType primitiveType : getPossibleTypes()) {
+			if (!primitiveType.isObjectOrArray()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public static ArgType convertFromPrimitiveType(PrimitiveType primitiveType) {
 		switch (primitiveType) {
 			case BOOLEAN:
@@ -792,6 +805,10 @@ public abstract class ArgType {
 					}
 				}
 			}
+			ArgType outerType = getOuterType();
+			if (outerType != null) {
+				return outerType.containsTypeVariable();
+			}
 			return false;
 		}
 		if (isArray()) {
@@ -803,10 +820,15 @@ public abstract class ArgType {
 		return false;
 	}
 
+	public boolean isVoid() {
+		return isPrimitive() && getPrimitiveType() == PrimitiveType.VOID;
+	}
+
 	/**
 	 * Recursively visit all subtypes of this type.
 	 * To exit return non-null value.
 	 */
+	@Nullable
 	public <R> R visitTypes(Function<ArgType, R> visitor) {
 		R r = visitor.apply(this);
 		if (r != null) {

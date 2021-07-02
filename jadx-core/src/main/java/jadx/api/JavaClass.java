@@ -66,11 +66,6 @@ public final class JavaClass implements JavaNode {
 		return cls.getSmali();
 	}
 
-	public synchronized void unload() {
-		cls.unload();
-		listsLoaded = false;
-	}
-
 	/**
 	 * Internal API. Not Stable!
 	 */
@@ -131,12 +126,16 @@ public final class JavaClass implements JavaNode {
 		return decompiler;
 	}
 
-	private Map<CodePosition, Object> getCodeAnnotations() {
+	public Map<CodePosition, Object> getCodeAnnotations() {
 		ICodeInfo code = getCodeInfo();
 		if (code == null) {
 			return Collections.emptyMap();
 		}
 		return code.getAnnotations();
+	}
+
+	public Object getAnnotationAt(CodePosition pos) {
+		return getCodeAnnotations().get(pos);
 	}
 
 	public Map<CodePosition, JavaNode> getUsageMap() {
@@ -224,9 +223,23 @@ public final class JavaClass implements JavaNode {
 		return methods;
 	}
 
+	@Nullable
+	public JavaMethod searchMethodByShortId(String shortId) {
+		MethodNode methodNode = cls.searchMethodByShortId(shortId);
+		if (methodNode == null) {
+			return null;
+		}
+		return new JavaMethod(this, methodNode);
+	}
+
 	@Override
 	public int getDecompiledLine() {
 		return cls.getDecompiledLine();
+	}
+
+	@Override
+	public int getDefPos() {
+		return cls.getDefPosition();
 	}
 
 	@Override
